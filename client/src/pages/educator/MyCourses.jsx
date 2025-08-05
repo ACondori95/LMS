@@ -54,9 +54,7 @@ const MyCourses = () => {
                           (course.discount * course.coursePrice) / 100)
                     )}
                   </td>
-                  <td className='px-4 py-3'>
-                    {course.enrolledStudents.length}
-                  </td>
+                  <td className='px-4 py-3'>{course.enrolledStudent.length}</td>
                   <td className='px-4 py-3'>
                     {new Date(course.createdAt).toLocaleDateString()}
                   </td>
