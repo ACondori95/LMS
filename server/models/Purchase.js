@@ -8,7 +8,7 @@ const PurchaseSchema = new mongoose.Schema(
       required: true,
     },
     userId: {type: String, ref: "User", required: true},
-    amount: {type: Number, required: true},
+    amount: {type: Number, required: true, min: 0},
     status: {
       type: String,
       enum: ["pending", "completed", "failed"],
@@ -18,4 +18,6 @@ const PurchaseSchema = new mongoose.Schema(
   {timestamps: true}
 );
 
-export const Purchase = mongoose.model("Purchase", PurchaseSchema);
+const Purchase = mongoose.model("Purchase", PurchaseSchema);
+
+export default Purchase;

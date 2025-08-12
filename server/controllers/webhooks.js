@@ -1,8 +1,14 @@
 import {Webhook} from "svix";
 import User from "../models/User.js";
-import Stripe from "stripe";
-import {Purchase} from "../models/Purchase.js";
+import Purchase from "../models/Purchase.js";
 import Course from "../models/Course.js";
+import {MercadoPagoConfig, Payment} from "mercadopago";
+
+// Initialize Mercado Pago with a client instance
+const client = new MercadoPagoConfig({
+  accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN,
+});
+const paymentClient = new Payment(client);
 
 // API Controller Function to Manage Clerk User with database
 export const clerkWebhooks = async (req, res) => {
@@ -35,7 +41,6 @@ export const clerkWebhooks = async (req, res) => {
           .json({success: true, message: "User created successfully."});
         break;
       }
-
       case "user.updated": {
         const fullName = [data.first_name, data.last_name]
           .filter(Boolean)
@@ -52,16 +57,6 @@ export const clerkWebhooks = async (req, res) => {
           .json({success: true, message: "User updated successfully."});
         break;
       }
-
-      case "user.deleted": {
-        await User.findByIdAndDelete(data.id);
-        console.log(`User deleted: ${data.id}`);
-        res
-          .status(200)
-          .json({success: true, message: "User deleted successfully."});
-        break;
-      }
-
       default:
         res.status(200).json({
           success: true,
@@ -70,78 +65,81 @@ export const clerkWebhooks = async (req, res) => {
         break;
     }
   } catch (error) {
-    console.error("Webhook processing error:", error);
-    res.json({
+    console.error("Clerk Webhook processing error:", error);
+    res.status(400).json({
       success: false,
-      message: error.message || "Webhook processing failed.",
+      message: error.message || "Clerk webhook processing failed.",
     });
   }
 };
 
-const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY);
+// Mercado Pago Webhook
+export const mercadopagoWebhooks = async (req, res) => {
+  const {body} = req;
+  const {type, data} = body;
 
-export const stripeWebhooks = async (request, response) => {
-  const sig = request.headers["stripe-signature"];
-
-  let event;
+  // Mercado Pago required a 200 response to indicate the webhook was received.
+  // The logic is handled after sending the response.
+  res.status(200).send("OK");
 
   try {
-    event = Stripe.webhooks.constructEvent(
-      request.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    response.status(400).send(`Webhook Error: ${err.message}`);
-  }
+    if (type === "payment") {
+      const paymentDetails = await paymentClient.get({id: data.id});
+      const {external_reference, status} = paymentDetails.body;
+      const purchaseId = external_reference;
 
-  // Handle the event
-  switch (event.type) {
-    case "payment_intent.succeeded": {
-      const paymentIntent = event.data.object;
-      const paymentIntentId = paymentIntent.id;
+      if (!purchaseId) {
+        console.error("Mercado Pago Webhook Error: Missing external_reference");
+        return;
+      }
 
-      const session = await stripeInstance.checkout.sessions.list({
-        payment_intent: paymentIntentId,
-      });
+      if (status === "approved") {
+        const purchaseData = await Purchase.findByIdAndUpdate(
+          purchaseId,
+          {status: "completed"},
+          {new: true}
+        );
 
-      const {purchaseId} = session.data[0].metadata;
+        if (!purchaseData) {
+          console.error(`Purchase with ID ${purchaseId} not found.`);
+          return;
+        }
 
-      const purchaseData = await Purchase.findById(purchaseId);
-      const userData = await User.findById(purchaseData.userId);
-      const courseData = await Course.findById(
-        purchaseData.courseId.toString()
-      );
+        const userData = await User.findById(purchaseData.userId);
+        const courseData = await Course.findById(purchaseData.courseId);
 
-      courseData.enrolledStudents.push(userData);
-      await courseData.save();
+        if (!userData || !courseData) {
+          console.error(
+            `User of course not found for purchase ID ${purchaseId}`
+          );
+          return;
+        }
 
-      userData.enrolledCourses.push(courseData._id);
-      await userData.save();
+        // Add the course to the user's enrolled list
+        userData.enrolledCourses.addToSet(courseData._id);
+        await userData.save();
 
-      purchaseData.status = "completed";
-      await purchaseData.save();
+        // Add the user to the course's enrolled students list
+        courseData.enrolledStudents.addToSet(userData._id);
+        await courseData.save();
 
-      break;
+        console.log(
+          `Purchase completed for user ${userData._id} and course ${courseData._id}`
+        );
+      } else if (status === "rejected") {
+        await Purchase.findByIdAndUpdate(
+          purchaseId,
+          {status: "failed"},
+          {new: true}
+        );
+        console.log(`Purchase failed for purchase ID ${purchaseId}`);
+      } else {
+        console.log(`Unhandled Mercado Pago webhook status: ${status}`);
+      }
+    } else {
+      console.log(`Unhandled Mercado Pago webhook type: ${type}`);
     }
-
-    case "payment_method.payment_failed": {
-      const paymentIntent = event.data.object;
-      const paymentIntentId = paymentIntent.id;
-
-      const session = await stripeInstance.checkout.sessions.list({
-        payment_intent: paymentIntentId,
-      });
-
-      const {purchaseId} = session.data[0].metadata;
-      const purchaseData = await Purchase.findById(purchaseId);
-      purchaseData.status = "failed";
-      await purchaseData.save();
-
-      break;
-    }
-    // ... handle other event types
-    default:
-      console.log(`Unhandled event type ${event.type}`);
+  } catch (error) {
+    console.error("Mercado Pago Webhook processing error:", error);
   }
 };

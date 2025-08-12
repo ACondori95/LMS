@@ -1,129 +1,154 @@
 import {clerkClient} from "@clerk/express";
 import Course from "../models/Course.js";
 import {v2 as cloudinary} from "cloudinary";
-import {Purchase} from "../models/Purchase.js";
-import User from "../models/User.js";
+import Purchase from "../models/Purchase.js";
 
-// Update role to educator
+// Helper function for consistent error responses
+const sendErrorResponse = (res, statusCode, message) => {
+  console.error(message);
+  res.status(statusCode).json({success: false, message});
+};
+
+// --- Update role to educator ---
 export const updateRoleToEducator = async (req, res) => {
   try {
-    console.log("Hello");
-    const userId = req.auth.userId;
-
-    console.log(userId);
+    const {userId} = req.auth;
+    if (!userId) {
+      return sendErrorResponse(res, 401, "User not authenticated.");
+    }
 
     await clerkClient.users.updateUserMetadata(userId, {
       publicMetadata: {role: "educator"},
     });
 
-    res.json({success: true, message: "You can publish a course now"});
+    res.status(200).json({success: true, message: "Role updated to educator."});
   } catch (error) {
-    res.json({success: false, message: error.message});
+    sendErrorResponse(res, 500, `Failed to update role: ${error.message}`);
   }
 };
 
-// Add New Course
+// --- Add New Course ---
 export const addCourse = async (req, res) => {
   try {
     const {courseData} = req.body;
     const imageFile = req.file;
-    const educatorId = req.auth.userId;
+    const {userId} = req.auth;
 
     if (!imageFile) {
-      return res.json({success: false, message: "Thumbnail Not Attached"});
+      return sendErrorResponse(res, 400, "Thumbnail not attached.");
     }
 
-    const parsedCourseData = await JSON.parse(courseData);
-    parsedCourseData.educator = educatorId;
-    const newCourse = await Course.create(parsedCourseData);
-    const imageUpload = await cloudinary.uploader.upload(imageFile.path);
-    newCourse.courseThumbnail = imageUpload.secure_url;
-    await newCourse.save();
+    // Upload the image to Cloudinary first
+    const imageUpload = await cloudinary.uploader.upload(imageFile.path, {
+      folder: "course-thumbnail",
+    });
 
-    res.json({success: true, message: "Course Added"});
+    // Parse the courseData string
+    const parsedCourseData = JSON.parse(courseData);
+
+    // Add the educator ID and course thumbnail URL
+    const newCourse = await Course.create({
+      ...parsedCourseData,
+      educator: userId,
+      courseThumbnail: imageUpload.secure_url,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Course added successfully.",
+      course: newCourse,
+    });
   } catch (error) {
-    res.json({success: false, message: error.message});
+    sendErrorResponse(res, 500, `Failed to add course: ${error.message}`);
   }
 };
 
-// Get Educator Courses
+// --- Get Educator Courses ---
 export const getEducatorCourses = async (req, res) => {
   try {
-    const educator = req.auth.userId;
-    const courses = await Course.find({educator});
-    res.json({success: true, courses});
+    const {userId} = req.auth;
+    const courses = await Course.find({educator: userId}).select("-__v");
+    res.status(200).json({success: true, courses});
   } catch (error) {
-    res.json({success: false, message: error.message});
+    sendErrorResponse(
+      res,
+      500,
+      `Failed to fetch educator courses: ${error.message}`
+    );
   }
 };
 
-// Get Educator Dashboard Data (Total Earning, Enrolled Students, No. of Courses)
+// --- Get Educator Dashboard Data ---
 export const educatorDashboardData = async (req, res) => {
   try {
-    const educator = req.auth.userId;
-    const courses = await Course.find({educator});
-    const totalCourses = courses.length;
+    const {userId} = req.auth;
 
+    // Fetch all courses by the educator
+    const courses = await Course.find({educator: userId}).select(
+      "_id courseTitle courseRating"
+    );
+    const totalCourses = courses.length;
     const courseIds = courses.map((course) => course._id);
 
-    // Calculate total earnings from purchases
-    const purchases = await Purchase.find({
-      courseId: {$in: courseIds},
-      status: "completed",
-    });
+    // Use aggregation to get total earnings and enrolled students
+    const purchases = await Purchase.aggregate([
+      {$match: {courseId: {$in: courseIds}, status: "completed"}},
+      {
+        $group: {
+          _id: null,
+          totalEarnings: {$sum: "$amount"},
+          totalStudents: {$sum: 1},
+        },
+      },
+    ]);
 
-    const totalEarnings = purchases.reduce(
-      (sum, purchase) => sum + purchase.amount,
-      0
-    );
+    const totalEarnings = purchases.length > 0 ? purchases[0].totalEarnings : 0;
+    const totalStudents = purchases.length > 0 ? purchases[0].totalStudents : 0;
 
-    // Collect unique enrolled student IDs with their course titles
-    const enrolledStudentsData = [];
-    for (const course of courses) {
-      const students = await User.find(
-        {_id: {$in: course.enrolledStudents}},
-        "name imageUrl"
-      );
-
-      students.forEach((student) => {
-        enrolledStudentsData.push({
-          courseTitle: course.courseTitle,
-          student,
-        });
-      });
-    }
-
-    res.json({
+    res.status(200).json({
       success: true,
-      dashboardData: {totalEarnings, enrolledStudentsData, totalCourses},
+      dashboardData: {totalEarnings, totalStudents, totalCourses, courses},
     });
   } catch (error) {
-    res.json({success: false, message: error.message});
+    sendErrorResponse(
+      res,
+      500,
+      `Failed to fetch dashboard data: ${error.message}`
+    );
   }
 };
 
-// Get Enrolled Students Data with Purchase Data
+// --- Get Enrolled Students Data ---
 export const getEnrolledStudentsData = async (req, res) => {
   try {
-    const educator = req.auth.userId;
-    const courses = await Course.find({educator});
+    const {userId} = req.auth;
+
+    // Find all courses by the educator
+    const courses = await Course.find({educator: userId});
     const courseIds = courses.map((course) => course._id);
 
-    const purchases = await Purchase.find({
+    // Find all purchases for these courses and populate user and course data
+    const enrolledStudents = await Purchase.find({
       courseId: {$in: courseIds},
       status: "completed",
     })
-      .populate("userId", "name imageUrl")
+      .populate("userId", "firstName lastName imageUrl")
       .populate("courseId", "courseTitle");
 
-    const enrolledStudents = purchases.map((purchase) => ({
-      student: purchase.userId,
+    // Reformat the data for a cleaner response
+    const formattedStudents = enrolledStudents.map((purchase) => ({
+      studentName: `${purchase.userId.firstName} ${purchase.userId.lastName}`,
+      studentImageUrl: purchase.userId.imageUrl,
       courseTitle: purchase.courseId.courseTitle,
       purchaseDate: purchase.createdAt,
     }));
 
-    res.json({success: true, enrolledStudents});
+    res.status(200).json({success: true, enrolledStudents: formattedStudents});
   } catch (error) {
-    res.json({success: false, message: error.message});
+    sendErrorResponse(
+      res,
+      500,
+      `Failed to fetch enrolled students: ${error.message}`
+    );
   }
 };

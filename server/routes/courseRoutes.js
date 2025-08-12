@@ -3,7 +3,10 @@ import {getAllCourse, getCourseId} from "../controllers/courseController.js";
 
 const courseRouter = express.Router();
 
-courseRouter.get("/all", getAllCourse);
+// Get all courses
+courseRouter.get("/", getAllCourse);
+
+// Get a single course by ID
 courseRouter.get("/:id", getCourseId);
 
 export default courseRouter;
